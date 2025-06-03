@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine
 
-# For uploads: use SQLAlchemy engine for MySQL
 def get_sqlalchemy_engine():
     return create_engine("mysql+pymysql://Hawkar:Noway2025@188.36.44.146:8081/wells")
 
