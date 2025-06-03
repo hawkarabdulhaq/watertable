@@ -1,12 +1,8 @@
 import streamlit as st
-import matplotlib.pyplot as plt
 import mysql.connector
 
-from timeseries import timeseries_page
-from map import map_page
 from database import database_viewer_page
-from export import export_page
-from monthly import monthly_page  # <-- NEW
+from monthly import monthly_page
 
 st.set_page_config(page_title="Well Database Viewer", layout="wide")
 
@@ -29,18 +25,12 @@ if 'page' not in st.session_state:
 
 if st.sidebar.button("Database Viewer"):
     st.session_state.page = "Database Viewer"
-if st.sidebar.button("Time Series Chart"):
-    st.session_state.page = "Time Series Chart"
-if st.sidebar.button("Well Map"):
-    st.session_state.page = "Well Map"
-if st.sidebar.button("Export"):
-    st.session_state.page = "Export"
-if st.sidebar.button("Monthly"):    # <-- NEW BUTTON
+if st.sidebar.button("Monthly"):
     st.session_state.page = "Monthly"
 
 page = st.session_state.page
 
-# Open the connection once, share with all page functions
+# Open the connection once, share with both pages
 try:
     conn = get_mysql_conn()
 except Exception as e:
@@ -49,14 +39,7 @@ except Exception as e:
 
 if page == "Database Viewer":
     database_viewer_page(conn)
-elif page == "Time Series Chart":
-    timeseries_page(conn)
-elif page == "Well Map":
-    map_page(conn)
-elif page == "Export":
-    export_page(conn)
 elif page == "Monthly":
     monthly_page(conn)
 
-# Close the connection at the end
 conn.close()
