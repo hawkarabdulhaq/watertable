@@ -1,10 +1,5 @@
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine
-
-# ---------- SQLALCHEMY ENGINE FOR UPLOADS ----------
-def get_sqlalchemy_engine():
-    return create_engine("mysql+pymysql://Hawkar:Noway2025@188.36.44.146:8081/wells")
 
 def clean_numeric_columns(df):
     num_cols = [
@@ -31,6 +26,23 @@ def get_mysql_table_names(conn):
     tables = [row[0] for row in cur.fetchall()]
     cur.close()
     return tables
+
+def fast_mysql_insert(df, table_name, conn, chunksize=1000):
+    cursor = conn.cursor()
+    cols = ", ".join([f"`{col}`" for col in df.columns])
+    placeholders = ", ".join(["%s"] * len(df.columns))
+    sql = f"INSERT INTO {table_name} ({cols}) VALUES ({placeholders})"
+    rows = df.values.tolist()
+    n = len(rows)
+    progress = st.progress(0, text="Uploading...")
+    for i in range(0, n, chunksize):
+        batch = rows[i:i+chunksize]
+        cursor.executemany(sql, batch)
+        conn.commit()
+        progress.progress(min(i+chunksize, n)/n, text=f"Uploaded {min(i+chunksize, n)} / {n} rows")
+    progress.empty()
+    cursor.close()
+    st.success(f"Successfully uploaded {n} rows to {table_name}.")
 
 def database_viewer_page(conn):
     st.title("Well Database Page")
@@ -135,13 +147,7 @@ def database_viewer_page(conn):
                 st.dataframe(df_new.head())
 
                 if st.button(f"Upload to '{table_to_upload}' table"):
-                    st.info("Uploading... please wait. If your CSV is large, this may take a minute.")
-                    engine = get_sqlalchemy_engine()
-                    df_new.to_sql(
-                        table_to_upload, engine,
-                        if_exists='append', index=False, method='multi', chunksize=500
-                    )
-                    st.success(f"Successfully imported {len(df_new)} rows into '{table_to_upload}'!")
+                    fast_mysql_insert(df_new, table_to_upload, conn, chunksize=1000)
             except Exception as e:
                 st.error(f"Failed to import CSV: {e}")
         st.markdown("""
