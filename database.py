@@ -1,5 +1,10 @@
 import streamlit as st
 import pandas as pd
+from sqlalchemy import create_engine
+
+# For uploads: use SQLAlchemy engine for MySQL
+def get_sqlalchemy_engine():
+    return create_engine("mysql+pymysql://Hawkar:Noway2025@188.36.44.146:8081/wells")
 
 def clean_numeric_columns(df):
     num_cols = [
@@ -29,10 +34,9 @@ def get_mysql_table_names(conn):
 
 def database_viewer_page(conn):
     st.title("Well Database Page")
-
     tabs = st.tabs(["Database Viewer", "Upload CSV to Table"])
 
-    # ------------------- TAB 1: VIEWER/DELETE TAB -------------------
+    # -------- TAB 1: VIEWER/DELETE --------
     with tabs[0]:
         table_names = get_mysql_table_names(conn)
         table_to_show = st.selectbox("Select table to display:", table_names)
@@ -108,7 +112,7 @@ def database_viewer_page(conn):
             except Exception as e:
                 st.error(f"Could not delete data: {e}")
 
-    # ------------------- TAB 2: UPLOAD TAB -------------------
+    # -------- TAB 2: UPLOAD CSV --------
     with tabs[1]:
         st.header("Upload CSV to Any Table")
         st.markdown("You can upload a CSV to any table. The columns must match the table columns exactly (see note below for accented columns).")
@@ -121,7 +125,7 @@ def database_viewer_page(conn):
             try:
                 df_new = pd.read_csv(uploaded_file)
 
-                # Handle accented columns for talajviz_table
+                # Handle accented columns for talajviz_table and melyviz_table
                 if table_to_upload == "talajviz_table":
                     col_rename = {'Dátum': 'Datum', 'Talajvízállás': 'Talajvizallas'}
                     df_new = df_new.rename(columns=col_rename)
@@ -132,7 +136,8 @@ def database_viewer_page(conn):
                 st.write("First 5 rows of your file (after column name fix if any):")
                 st.dataframe(df_new.head())
                 if st.button(f"Upload to '{table_to_upload}' table"):
-                    df_new.to_sql(table_to_upload, conn, if_exists='append', index=False, method='multi')
+                    engine = get_sqlalchemy_engine()
+                    df_new.to_sql(table_to_upload, engine, if_exists='append', index=False, method='multi')
                     st.success(f"Successfully imported {len(df_new)} rows into '{table_to_upload}'!")
             except Exception as e:
                 st.error(f"Failed to import CSV: {e}")
