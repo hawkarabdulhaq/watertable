@@ -1,16 +1,13 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import matplotlib.pyplot as plt
 
-def monthly_page(db_path):
+def monthly_page(conn):
     st.title("Monthly Groundwater Table Summary (Min/Mean/Max)")
 
     table_choice = st.selectbox("Select table", ['talajviz_table', 'melyviz_table'])
     try:
-        conn = sqlite3.connect(db_path)
-        df = pd.read_sql_query(f"SELECT * FROM {table_choice}", conn)
-        conn.close()
+        df = pd.read_sql(f"SELECT * FROM {table_choice}", conn)
     except Exception as e:
         st.error(f"Failed to load {table_choice}: {e}")
         return
@@ -28,7 +25,6 @@ def monthly_page(db_path):
         st.error(f"Could not find 'Talajvízállás' or 'Talajvizallas' in {table_choice}.")
         return
 
-    # Always (re)compute vizkutfenekmagasag for safety
     df['vizkutfenekmagasag'] = df[col1] + df[col2]
     value_col = 'vizkutfenekmagasag'
 
