@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine
 
+# ---------- SQLALCHEMY ENGINE FOR UPLOADS ----------
 def get_sqlalchemy_engine():
     return create_engine("mysql+pymysql://Hawkar:Noway2025@188.36.44.146:8081/wells")
 
@@ -46,7 +47,6 @@ def database_viewer_page(conn):
             return
 
         df = clean_numeric_columns(df)
-
         st.markdown(f"Showing **{len(df)}** rows from **{table_to_show}**.")
         st.dataframe(df, use_container_width=True)
 
@@ -115,7 +115,6 @@ def database_viewer_page(conn):
     with tabs[1]:
         st.header("Upload CSV to Any Table")
         st.markdown("You can upload a CSV to any table. The columns must match the table columns exactly (see note below for accented columns).")
-
         table_names = get_mysql_table_names(conn)
         table_to_upload = st.selectbox("Select table to upload to:", table_names, key="upload_select_table")
 
@@ -134,9 +133,14 @@ def database_viewer_page(conn):
 
                 st.write("First 5 rows of your file (after column name fix if any):")
                 st.dataframe(df_new.head())
+
                 if st.button(f"Upload to '{table_to_upload}' table"):
+                    st.info("Uploading... please wait. If your CSV is large, this may take a minute.")
                     engine = get_sqlalchemy_engine()
-                    df_new.to_sql(table_to_upload, engine, if_exists='append', index=False, method='multi')
+                    df_new.to_sql(
+                        table_to_upload, engine,
+                        if_exists='append', index=False, method='multi', chunksize=500
+                    )
                     st.success(f"Successfully imported {len(df_new)} rows into '{table_to_upload}'!")
             except Exception as e:
                 st.error(f"Failed to import CSV: {e}")
