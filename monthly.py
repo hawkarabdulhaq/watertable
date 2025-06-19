@@ -3,9 +3,11 @@ import io
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-from sqlalchemy.engine import Engine  # type-hint only
+from sqlalchemy.engine import Engine         # type-hint only
 
-# --- Metadata sources and columns ---------------------------------------------
+# ──────────────────────────────────────────────────────────────
+# 1.  Metadata sources & columns
+# ──────────────────────────────────────────────────────────────
 SHALLOW_CSV_URL = (
     "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/shallow.csv"
 )
@@ -37,46 +39,72 @@ DEEP_COLS = [
 ]
 
 @st.cache_data(show_spinner=False)
-def _load_shallow_meta():
-    df = pd.read_csv(SHALLOW_CSV_URL, usecols=lambda c: c in SHALLOW_COLS)
-    return df.drop_duplicates(subset="Rendszam")
+def load_shallow_meta() -> pd.DataFrame:
+    return (
+        pd.read_csv(SHALLOW_CSV_URL, usecols=lambda c: c in SHALLOW_COLS)
+        .drop_duplicates(subset="Rendszam")
+    )
 
 @st.cache_data(show_spinner=False)
-def _load_deep_meta():
-    df = pd.read_csv(DEEP_CSV_URL, usecols=lambda c: c in DEEP_COLS)
-    return df.drop_duplicates(subset="Rendszam")
+def load_deep_meta() -> pd.DataFrame:
+    return (
+        pd.read_csv(DEEP_CSV_URL, usecols=lambda c: c in DEEP_COLS)
+        .drop_duplicates(subset="Rendszam")
+    )
 
-def _load_table(engine: Engine, table: str) -> pd.DataFrame:
-    sql = f"SELECT * FROM `{table}`"
+def load_table(engine: Engine, name: str) -> pd.DataFrame:
+    sql = f"SELECT * FROM `{name}`"
     with engine.connect() as conn:
         return pd.read_sql_query(sql, conn)
 
+# ──────────────────────────────────────────────────────────────
+# 2.  Main Streamlit page
+# ──────────────────────────────────────────────────────────────
 def monthly_page(engine: Engine) -> None:
     st.title("Monthly Groundwater Table Summary (Min / Mean / Max)")
+    debug = st.sidebar.checkbox("🔧 Debug mode")
 
+    # --------------------------------- choose & load data
     table_choice = st.selectbox(
         "Select groundwater table", ["talajviz_table", "melyviz_table"]
     )
     try:
-        df = _load_table(engine, table_choice)
+        df = load_table(engine, table_choice)
     except Exception as e:
         st.error(f"Failed to load {table_choice}: {e}")
         return
+    if debug:
+        st.sidebar.write(f"SQL table shape: {df.shape}")
 
-    # Select and merge metadata, handling duplicate columns
+    # --------------------------------- choose metadata + merge
     if table_choice == "talajviz_table":
-        meta_cols, meta_df = SHALLOW_COLS, _load_shallow_meta()
-        # Drop any columns from meta that are already in SQL (except Rendszam)
-        drop_cols = [c for c in meta_cols if c != "Rendszam" and c in df.columns]
-        meta_df = meta_df.drop(columns=drop_cols)
-        df = df.merge(meta_df, on="Rendszam", how="left")
+        meta_cols, meta = SHALLOW_COLS, load_shallow_meta()
     else:
-        meta_cols, meta_df = DEEP_COLS, _load_deep_meta()
-        drop_cols = [c for c in meta_cols if c != "Rendszam" and c in df.columns]
-        meta_df = meta_df.drop(columns=drop_cols)
-        df = df.merge(meta_df, on="Rendszam", how="left")
+        meta_cols, meta = DEEP_COLS, load_deep_meta()
 
-    # Column mapping (logic unchanged)
+    # drop SQL-duplicate columns from meta (except Rendszam)
+    dupes = [c for c in meta_cols if c != "Rendszam" and c in df.columns]
+    if dupes:
+        meta = meta.drop(columns=dupes)
+        if debug:
+            st.sidebar.write(f"Dropped duplicate cols from meta: {dupes}")
+
+    if debug:
+        st.sidebar.write(f"Metadata shape: {meta.shape}")
+        with st.expander("Metadata head"):
+            st.dataframe(meta.head())
+
+    df = df.merge(meta, on="Rendszam", how="left")
+    if debug:
+        found = df["VMOEov_EOVx"].notna().sum()
+        total = len(df)
+        st.sidebar.write(
+            f"Coordinate merge — non-null VMOEov_EOVx/EOVy rows: {found}/{total}"
+        )
+        with st.expander("Post-merge coordinates preview"):
+            st.dataframe(df[["Rendszam","VMOEov_EOVx","VMOEov_EOVy"]].head())
+
+    # --------------------------------- column mapping
     col1 = (
         "vFkAllomas_TalajvizkutKutperemmag"
         if table_choice == "talajviz_table"
@@ -91,6 +119,7 @@ def monthly_page(engine: Engine) -> None:
         st.error("Required columns are missing in the selected table.")
         return
 
+    # --------------------------------- derived & date parts
     df["vizkutfenekmagasag"] = df[col1] + df[col2]
     if "Datum" not in df.columns:
         st.error("No 'Datum' column found.")
@@ -99,6 +128,7 @@ def monthly_page(engine: Engine) -> None:
     df["Year"]  = df["Datum"].dt.year
     df["Month"] = df["Datum"].dt.month
 
+    # --------------------------------- well selector
     wells = sorted(df["Rendszam"].dropna().unique())
     selected = st.multiselect(
         "Select wells for time-series plot",
@@ -107,75 +137,67 @@ def monthly_page(engine: Engine) -> None:
     )
 
     df_valid = df.dropna(subset=["Rendszam", "Year", "Month", "vizkutfenekmagasag"])
-    df_plot = (
-        df_valid[df_valid["Rendszam"].isin(selected)] if selected else df_valid
-    )
+    df_plot = df_valid[df_valid["Rendszam"].isin(selected)] if selected else df_valid
 
+    # --------------------------------- stat checkboxes
     st.subheader("Statistics to include")
-    opts = {
-        "mean": st.checkbox("Mean", value=True, key="chk_mean"),
-        "min":  st.checkbox("Min",  value=True, key="chk_min"),
-        "max":  st.checkbox("Max",  value=True, key="chk_max"),
-    }
-    stats = [k for k, v in opts.items() if v]
+    stats = [s for s, flag in [
+        ("mean", st.checkbox("Mean", True)),
+        ("min",  st.checkbox("Min",  True)),
+        ("max",  st.checkbox("Max",  True)),
+    ] if flag]
     if not stats:
         st.warning("Please select at least one statistic.")
         return
 
+    # --------------------------------- aggregate for preview & plot
     agg = (
-        df_plot.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
-        .agg(stats)
-        .reset_index()
+        df_plot.groupby(["Rendszam","Year","Month"])["vizkutfenekmagasag"]
+        .agg(stats).reset_index()
     )
     agg["date"] = pd.to_datetime(dict(year=agg["Year"], month=agg["Month"], day=1))
-    agg = agg.merge(meta_df, on="Rendszam", how="left")
+    agg = agg.merge(meta, on="Rendszam", how="left")
+    st.dataframe(agg.sort_values(["Rendszam","date"]), use_container_width=True)
 
-    st.dataframe(agg.sort_values(["Rendszam", "date"]), use_container_width=True)
-
+    # --------------------------------- plot
     st.subheader("Time-series plot")
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=(12,4))
     cmap = plt.get_cmap("tab10")
     for idx, w in enumerate(sorted(agg["Rendszam"].unique())):
-        g, color = agg[agg["Rendszam"] == w], cmap(idx % 10)
-        if "mean" in stats:
-            plt.plot(g["date"], g["mean"], label=f"{w} Mean", color=color, ls="-")
-        if "max" in stats:
-            plt.plot(g["date"], g["max"],  label=f"{w} Max",  color=color, ls="--")
-        if "min" in stats:
-            plt.plot(g["date"], g["min"],  label=f"{w} Min",  color=color, ls=":")
+        g, color = agg[agg["Rendszam"]==w], cmap(idx%10)
+        if "mean" in stats: plt.plot(g["date"],g["mean"],label=f"{w} Mean",color=color,ls="-")
+        if "max"  in stats: plt.plot(g["date"],g["max"], label=f"{w} Max", color=color,ls="--")
+        if "min"  in stats: plt.plot(g["date"],g["min"], label=f"{w} Min", color=color,ls=":")
     plt.xlabel("Date"); plt.ylabel("vizkutfenekmagasag")
-    plt.title("Monthly statistics by well")
     plt.legend(); plt.tight_layout()
     st.pyplot(plt.gcf()); plt.clf()
 
+    # --------------------------------- wide table for download
     agg_all = (
-        df_valid.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
-        .agg(stats)
-        .reset_index()
+        df_valid.groupby(["Rendszam","Year","Month"])["vizkutfenekmagasag"]
+        .agg(stats).reset_index()
     )
-    # Wide table
-    parts = []
+    parts=[]
     for s in stats:
-        w = agg_all.pivot(index="Rendszam", columns=["Year", "Month"], values=s)
-        w.columns = [f"{int(y)}_{int(m):02d}_{s}" for y, m in w.columns]
+        w = agg_all.pivot(index="Rendszam", columns=["Year","Month"], values=s)
+        w.columns=[f"{int(y)}_{int(m):02d}_{s}" for y,m in w.columns]
         parts.append(w)
     wide = pd.concat(parts, axis=1).reset_index()
-    wide = meta_df.merge(wide, on="Rendszam", how="right")
+    wide = meta.merge(wide,on="Rendszam",how="right")
 
-    # Order columns: Rendszam, meta fields, then stats blocks
-    ordered = ["Rendszam"]
-    ordered += [c for c in meta_cols if c != "Rendszam" and c in wide.columns]
-    for base in sorted({c.rsplit("_", 1)[0] for c in wide.columns if c not in ordered}):
+    # order columns
+    ordered=["Rendszam"]+[c for c in meta.columns if c!="Rendszam"]
+    for base in sorted({c.rsplit("_",1)[0] for c in wide.columns if c not in ordered}):
         for s in stats:
-            col = f"{base}_{s}"
-            if col in wide.columns:
-                ordered.append(col)
-    wide = wide[ordered]
+            col=f"{base}_{s}"
+            if col in wide.columns: ordered.append(col)
+    wide=wide[ordered]
     st.dataframe(wide.head(), use_container_width=True)
 
-    buff = io.BytesIO()
+    # --------------------------------- download
+    buff=io.BytesIO()
     with pd.ExcelWriter(buff, engine="xlsxwriter") as xls:
-        wide.to_excel(xls, index=False, sheet_name="MonthlyWide")
+        wide.to_excel(xls,index=False,sheet_name="MonthlyWide")
     st.download_button(
         "Download selected statistics (Excel)",
         buff.getvalue(),
