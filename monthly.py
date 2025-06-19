@@ -3,48 +3,24 @@ import io
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-from sqlalchemy.engine import Engine   # type hint only
+from sqlalchemy.engine import Engine
 
-# ────────────────────────────────────────────────────────────────────────────
-# Helper: load a whole DB table with SQLAlchemy
-# ────────────────────────────────────────────────────────────────────────────
+# Load the deep.csv well details for VMOEov_EOVx/VMOEov_EOVy lookup
+@st.cache_data(show_spinner="Loading well locations…")
+def load_well_metadata():
+    url = "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/deep.csv"
+    df_meta = pd.read_csv(url)
+    # Use only Rendszam, VMOEov_EOVx, VMOEov_EOVy for merge
+    return df_meta[["Rendszam", "VMOEov_EOVx", "VMOEov_EOVy"]].drop_duplicates("Rendszam")
+
 def _load_table(engine: Engine, table_name: str) -> pd.DataFrame:
     query = f"SELECT * FROM `{table_name}`"
     with engine.connect() as conn:
         return pd.read_sql_query(query, conn)
 
-# ────────────────────────────────────────────────────────────────────────────
-# Helper: read & cache the coordinate reference file (deep.csv)
-# ────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def get_coord_mapping() -> pd.DataFrame:
-    """
-    Return a DataFrame with columns: Rendszam, VMOEov_EOVx, VMOEov_EOVy.
-    If the file can't be loaded, an empty dataframe with those columns
-    is returned so downstream code still works.
-    """
-    url = (
-        "https://raw.githubusercontent.com/"
-        "hawkarabdulhaq/watertable/main/input/deep.csv"
-    )
-    cols_needed = ["Rendszam", "VMOEov_EOVx", "VMOEov_EOVy"]
-    try:
-        df_coord = pd.read_csv(url, usecols=cols_needed)
-        # Ensure uniqueness
-        df_coord = df_coord.drop_duplicates(subset="Rendszam")
-        return df_coord
-    except Exception as e:
-        st.warning(f"Could not load well-coordinate file: {e}")
-        return pd.DataFrame(columns=cols_needed)
-
-# ────────────────────────────────────────────────────────────────────────────
-# MAIN PAGE
-# ────────────────────────────────────────────────────────────────────────────
 def monthly_page(engine: Engine) -> None:
-    """Interactive Monthly statistics with optional coordinates."""
     st.title("Monthly Groundwater Table Summary (Min / Mean / Max)")
 
-    # 1️⃣  Select the source table -------------------------------------------------
     table_choice = st.selectbox(
         "Select groundwater table",
         ["talajviz_table", "melyviz_table"]
@@ -56,20 +32,21 @@ def monthly_page(engine: Engine) -> None:
         st.error(f"Failed to load {table_choice}: {e}")
         return
 
-    # 2️⃣  If we're on 'melyviz_table', merge coordinates -------------------------
+    # For melyviz_table, load and merge metadata
     if table_choice == "melyviz_table":
-        coord_df = get_coord_mapping()
-        df = df.merge(coord_df, on="Rendszam", how="left")
+        meta = load_well_metadata()
+        df = df.merge(meta, on="Rendszam", how="left")
+    else:
+        df["VMOEov_EOVx"] = None
+        df["VMOEov_EOVy"] = None
 
-    # 3️⃣  column mapping & calculated field --------------------------------------
     col1 = (
         "vFkAllomas_TalajvizkutKutperemmag"
         if table_choice == "talajviz_table"
         else "vFaAllomas_RetegvizkutKutperemmag"
     )
     col2 = (
-        "Talajvízállás"
-        if "Talajvízállás" in df.columns
+        "Talajvízállás" if "Talajvízállás" in df.columns
         else ("Talajvizallas" if "Talajvizallas" in df.columns else None)
     )
     if col2 is None or col1 not in df.columns:
@@ -82,10 +59,9 @@ def monthly_page(engine: Engine) -> None:
         st.error("No 'Datum' column found.")
         return
     df["Datum"] = pd.to_datetime(df["Datum"], errors="coerce")
-    df["Year"]  = df["Datum"].dt.year
+    df["Year"] = df["Datum"].dt.year
     df["Month"] = df["Datum"].dt.month
 
-    # 4️⃣  Well selector -----------------------------------------------------------
     rendszam_unique = sorted(df["Rendszam"].dropna().unique())
     selected_rendszam = st.multiselect(
         "Select wells for time-series plot",
@@ -94,16 +70,15 @@ def monthly_page(engine: Engine) -> None:
     )
 
     df_valid = df.dropna(subset=["Rendszam", "Year", "Month", "vizkutfenekmagasag"])
-    df_plot  = (
+    df_plot = (
         df_valid[df_valid["Rendszam"].isin(selected_rendszam)]
         if selected_rendszam else df_valid.copy()
     )
 
-    # 5️⃣  Statistic check-boxes ---------------------------------------------------
     st.subheader("Statistics to include")
     show_mean = st.checkbox("Mean", value=True, key="chk_mean")
-    show_min  = st.checkbox("Min",  value=True, key="chk_min")
-    show_max  = st.checkbox("Max",  value=True, key="chk_max")
+    show_min = st.checkbox("Min", value=True, key="chk_min")
+    show_max = st.checkbox("Max", value=True, key="chk_max")
 
     selected_stats = [
         stat for stat, flag in
@@ -114,26 +89,27 @@ def monthly_page(engine: Engine) -> None:
         st.warning("Please select at least one statistic.")
         return
 
-    # 6️⃣  Aggregate for table & plot ----------------------------------------------
+    # ---- Aggregate for table/plot ----
+    group_cols = ["Rendszam", "Year", "Month"]
+    if table_choice == "melyviz_table":
+        group_cols += ["VMOEov_EOVx", "VMOEov_EOVy"]
     agg = (
-        df_plot.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
+        df_plot.groupby(group_cols)["vizkutfenekmagasag"]
         .agg(selected_stats)
         .reset_index()
     )
-    agg["date"] = pd.to_datetime(dict(year=agg["Year"], month=agg["Month"], day=1))
+    agg["date"] = pd.to_datetime(dict(year=agg["Year"],
+                                      month=agg["Month"], day=1))
 
-    # Merge coordinates (only present for 'melyviz_table')
+    # Show main table (always put coords after Rendszam for melyviz_table)
     if table_choice == "melyviz_table":
-        coord_cols = ["VMOEov_EOVx", "VMOEov_EOVy"]
-        agg = agg.merge(
-            df[["Rendszam"] + coord_cols].drop_duplicates("Rendszam"),
-            on="Rendszam",
-            how="left"
-        )
+        display_cols = ["Rendszam", "VMOEov_EOVx", "VMOEov_EOVy", "Year", "Month", "date"] + selected_stats
+    else:
+        display_cols = ["Rendszam", "Year", "Month", "date"] + selected_stats
+    display_cols = [c for c in display_cols if c in agg.columns]  # avoid errors
+    st.dataframe(agg.sort_values(["Rendszam", "date"])[display_cols], use_container_width=True)
 
-    st.dataframe(agg.sort_values(["Rendszam", "date"]), use_container_width=True)
-
-    # 7️⃣  Plot ---------------------------------------------------------------------
+    # ---- Plot ----
     st.subheader("Time-series plot")
     plt.figure(figsize=(12, 4))
     cmap = plt.get_cmap("tab10")
@@ -141,16 +117,15 @@ def monthly_page(engine: Engine) -> None:
     for idx, rendszam in enumerate(sorted(agg["Rendszam"].unique())):
         g = agg[agg["Rendszam"] == rendszam]
         color = cmap(idx % 10)
-        if "mean" in selected_stats:
+        if "mean" in selected_stats and "mean" in g.columns:
             plt.plot(g["date"], g["mean"], label=f"{rendszam} Mean",
                      color=color, linestyle="-")
-        if "max" in selected_stats:
+        if "max" in selected_stats and "max" in g.columns:
             plt.plot(g["date"], g["max"], label=f"{rendszam} Max",
                      color=color, linestyle="--")
-        if "min" in selected_stats:
+        if "min" in selected_stats and "min" in g.columns:
             plt.plot(g["date"], g["min"], label=f"{rendszam} Min",
                      color=color, linestyle=":")
-
     plt.xlabel("Date")
     plt.ylabel("vizkutfenekmagasag")
     plt.title("Monthly statistics by well")
@@ -159,44 +134,37 @@ def monthly_page(engine: Engine) -> None:
     st.pyplot(plt.gcf())
     plt.clf()
 
-    # 8️⃣  Build “wide” download table ---------------------------------------------
+    # ---- Wide table for Excel download ----
     agg_all = (
-        df_valid.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
+        df_valid.groupby(group_cols)["vizkutfenekmagasag"]
         .agg(selected_stats)
         .reset_index()
     )
 
+    wide_index = ["Rendszam"]
+    if table_choice == "melyviz_table":
+        wide_index += ["VMOEov_EOVx", "VMOEov_EOVy"]
     wide_parts = []
     for stat in selected_stats:
-        wide = agg_all.pivot(index="Rendszam", columns=["Year", "Month"], values=stat)
+        wide = agg_all.pivot(index=wide_index,
+                             columns=["Year", "Month"],
+                             values=stat)
         wide.columns = [f"{int(yr)}_{int(mn):02d}_{stat}" for yr, mn in wide.columns]
         wide_parts.append(wide)
-
     wide_full = pd.concat(wide_parts, axis=1).reset_index()
 
-    # Merge coordinates (again only for 'melyviz_table')
-    if table_choice == "melyviz_table":
-        wide_full = wide_full.merge(
-            coord_df, on="Rendszam", how="left"
-        )
-
-    # Re-order: Rendszam, EOVx, EOVy, then stats-blocks
-    leading_cols = ["Rendszam"]
-    if table_choice == "melyviz_table":
-        leading_cols += ["VMOEov_EOVx", "VMOEov_EOVy"]
-
-    ordered_cols = leading_cols.copy()
-    for base in sorted({c.rsplit("_", 1)[0] for c in wide_full.columns
-                        if c not in leading_cols}):
+    # Order columns: Rendszam, EOVx, EOVy (if present), then month blocks
+    ordered_cols = [col for col in wide_index]
+    for base in sorted({c.rsplit("_", 1)[0] for c in wide_full.columns if c not in wide_index}):
         for stat in selected_stats:
             col = f"{base}_{stat}"
             if col in wide_full.columns:
                 ordered_cols.append(col)
-
     wide_full = wide_full[ordered_cols]
+
     st.dataframe(wide_full.head(), use_container_width=True)
 
-    # 9️⃣  Excel download -----------------------------------------------------------
+    # ---- Excel download ----
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         wide_full.to_excel(writer, index=False, sheet_name="MonthlyWide")
