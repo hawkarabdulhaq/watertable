@@ -3,16 +3,20 @@ import io
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-from sqlalchemy.engine import Engine  # lint / type hint only
+from sqlalchemy.engine import Engine  # type-hint only
 
-# --------------------------------------------------------------------------- #
-# 1.  Metadata definition – ONE place to edit in the future
-# --------------------------------------------------------------------------- #
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  CSV with well metadata
+# ──────────────────────────────────────────────────────────────────────────────
+META_CSV_URL = (
+    "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/deep.csv"
+)
+
+# Columns to bring in from deep.csv – first is Rendszam (key)
 META_COLS = [
     "Rendszam",
     "VMOEov_EOVx",
     "VMOEov_EOVy",
-    "Torzsszam",
     "vmoNev",
     "VMOEov_Torzsszam",
     "vFaAllomas_AdatgazdaNev",
@@ -31,50 +35,50 @@ META_COLS = [
     "vFaAllomas_FaAllUzemelesNev",
 ]
 
-COORDS_CSV_URL = (
-    "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/deep.csv"
-)
-
-# --------------------------------------------------------------------------- #
-# 2.  Helpers
-# --------------------------------------------------------------------------- #
-def _load_table(engine: Engine, table_name: str) -> pd.DataFrame:
-    """Fetch an entire MySQL table via SQLAlchemy."""
-    q = f"SELECT * FROM `{table_name}`"
-    with engine.connect() as conn:
-        return pd.read_sql_query(q, conn)
-
-
 @st.cache_data(show_spinner=False)
-def _load_coords() -> pd.DataFrame:
-    """Read deep.csv once per session; keep only META_COLS."""
-    df = pd.read_csv(COORDS_CSV_URL, usecols=lambda c: c in META_COLS)
-    return df.drop_duplicates("Rendszam")
+def _load_meta() -> pd.DataFrame:
+    """Read deep.csv once per session, keep only META_COLS, return deduplicated."""
+    df = pd.read_csv(META_CSV_URL, usecols=lambda c: c in META_COLS)
+    return df.drop_duplicates(subset="Rendszam")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  SQL helper
+# ──────────────────────────────────────────────────────────────────────────────
+def _load_table(engine: Engine, table: str) -> pd.DataFrame:
+    """SELECT * FROM table via SQLAlchemy (no pandas warning)."""
+    sql = f"SELECT * FROM `{table}`"
+    with engine.connect() as conn:
+        return pd.read_sql_query(sql, conn)
 
-# --------------------------------------------------------------------------- #
+# ──────────────────────────────────────────────────────────────────────────────
 # 3.  Main Streamlit page
-# --------------------------------------------------------------------------- #
+# ──────────────────────────────────────────────────────────────────────────────
 def monthly_page(engine: Engine) -> None:
     st.title("Monthly Groundwater Table Summary (Min / Mean / Max)")
 
+    # ── 3.1 choose table & load ───────────────────────────────────────────────
     table_choice = st.selectbox(
-        "Select groundwater table",
-        ["talajviz_table", "melyviz_table"],
+        "Select groundwater table", ["talajviz_table", "melyviz_table"]
     )
-
     try:
         df = _load_table(engine, table_choice)
     except Exception as e:
         st.error(f"Failed to load {table_choice}: {e}")
         return
 
-    # ── Merge metadata if melyviz_table ───────────────────────────────────────
+    # ── 3.2 merge metadata if melyviz_table ──────────────────────────────────
     if table_choice == "melyviz_table":
-        coords = _load_coords()
-        df = df.merge(coords, on="Rendszam", how="left")
+        meta = _load_meta()
 
-    # ── Column mapping for water-level calc ───────────────────────────────────
+        # avoid duplicate cols that already exist in the SQL table
+        dupes = [c for c in META_COLS if c != "Rendszam" and c in df.columns]
+        meta = meta.drop(columns=dupes)
+
+        df = df.merge(meta, on="Rendszam", how="left")
+    else:
+        meta = None  # talajviz_table
+
+    # ── 3.3 required columns / derived field ─────────────────────────────────
     col1 = (
         "vFkAllomas_TalajvizkutKutperemmag"
         if table_choice == "talajviz_table"
@@ -86,128 +90,108 @@ def monthly_page(engine: Engine) -> None:
         else ("Talajvizallas" if "Talajvizallas" in df.columns else None)
     )
     if col2 is None or col1 not in df.columns:
-        st.error("Required water-level columns not found in the table.")
+        st.error("Required columns are missing in the selected table.")
         return
 
-    # ── Derived columns & time split ──────────────────────────────────────────
     df["vizkutfenekmagasag"] = df[col1] + df[col2]
     if "Datum" not in df.columns:
-        st.error("No 'Datum' column in the table.")
+        st.error("No 'Datum' column found.")
         return
     df["Datum"] = pd.to_datetime(df["Datum"], errors="coerce")
     df["Year"]  = df["Datum"].dt.year
     df["Month"] = df["Datum"].dt.month
 
-    # ── Well selector ─────────────────────────────────────────────────────────
-    rendszam_unique = sorted(df["Rendszam"].dropna().unique())
-    chosen_rendszam = st.multiselect(
+    # ── 3.4 well selector ────────────────────────────────────────────────────
+    wells = sorted(df["Rendszam"].dropna().unique())
+    selected = st.multiselect(
         "Select wells for time-series plot",
-        rendszam_unique,
-        default=rendszam_unique[:1] if rendszam_unique else [],
+        wells,
+        default=wells[:1] if wells else [],
     )
 
-    df_valid = df.dropna(
-        subset=["Rendszam", "Year", "Month", "vizkutfenekmagasag"]
-    )
+    df_valid = df.dropna(subset=["Rendszam", "Year", "Month", "vizkutfenekmagasag"])
     df_plot = (
-        df_valid[df_valid["Rendszam"].isin(chosen_rendszam)]
-        if chosen_rendszam
-        else df_valid.copy()
+        df_valid[df_valid["Rendszam"].isin(selected)] if selected else df_valid
     )
 
-    # ── Stat check-boxes ──────────────────────────────────────────────────────
+    # ── 3.5 stats check-boxes ────────────────────────────────────────────────
     st.subheader("Statistics to include")
-    show_mean = st.checkbox("Mean", value=True)
-    show_min  = st.checkbox("Min",  value=True)
-    show_max  = st.checkbox("Max",  value=True)
-
-    selected_stats = [
-        s for s, flag in [("mean", show_mean), ("min", show_min), ("max", show_max)] if flag
-    ]
-    if not selected_stats:
+    opts = {
+        "mean": st.checkbox("Mean", value=True, key="chk_mean"),
+        "min":  st.checkbox("Min",  value=True, key="chk_min"),
+        "max":  st.checkbox("Max",  value=True, key="chk_max"),
+    }
+    stats = [k for k, v in opts.items() if v]
+    if not stats:
         st.warning("Please select at least one statistic.")
         return
 
-    # ── Aggregation for preview & plot ────────────────────────────────────────
+    # ── 3.6 aggregate for preview / plot ─────────────────────────────────────
     agg = (
-        df_plot
-        .groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
-        .agg(selected_stats)
+        df_plot.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
+        .agg(stats)
         .reset_index()
     )
     agg["date"] = pd.to_datetime(dict(year=agg["Year"], month=agg["Month"], day=1))
-
-    # add metadata for preview if needed
-    if table_choice == "melyviz_table":
-        agg = agg.merge(coords, on="Rendszam", how="left")
+    if meta is not None:
+        agg = agg.merge(meta, on="Rendszam", how="left")
 
     st.dataframe(agg.sort_values(["Rendszam", "date"]), use_container_width=True)
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
+    # ── 3.7 plot ─────────────────────────────────────────────────────────────
     st.subheader("Time-series plot")
     plt.figure(figsize=(12, 4))
     cmap = plt.get_cmap("tab10")
-
-    for idx, r in enumerate(sorted(agg["Rendszam"].unique())):
-        g = agg[agg["Rendszam"] == r]
-        color = cmap(idx % 10)
-        if "mean" in selected_stats:
-            plt.plot(g["date"], g["mean"], label=f"{r} Mean", color=color, linestyle="-")
-        if "max" in selected_stats:
-            plt.plot(g["date"], g["max"],  label=f"{r} Max",  color=color, linestyle="--")
-        if "min" in selected_stats:
-            plt.plot(g["date"], g["min"],  label=f"{r} Min",  color=color, linestyle=":")
-    plt.xlabel("Date")
-    plt.ylabel("vizkutfenekmagasag")
+    for idx, w in enumerate(sorted(agg["Rendszam"].unique())):
+        g, color = agg[agg["Rendszam"] == w], cmap(idx % 10)
+        if "mean" in stats:
+            plt.plot(g["date"], g["mean"], label=f"{w} Mean", color=color, ls="-")
+        if "max" in stats:
+            plt.plot(g["date"], g["max"],  label=f"{w} Max",  color=color, ls="--")
+        if "min" in stats:
+            plt.plot(g["date"], g["min"],  label=f"{w} Min",  color=color, ls=":")
+    plt.xlabel("Date"); plt.ylabel("vizkutfenekmagasag")
     plt.title("Monthly statistics by well")
-    plt.legend()
-    plt.tight_layout()
-    st.pyplot(plt.gcf())
-    plt.clf()
+    plt.legend(); plt.tight_layout()
+    st.pyplot(plt.gcf()); plt.clf()
 
-    # ── Build WIDE table for download ─────────────────────────────────────────
+    # ── 3.8 build “wide” download table ──────────────────────────────────────
     agg_all = (
-        df_valid
-        .groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
-        .agg(selected_stats)
+        df_valid.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
+        .agg(stats)
         .reset_index()
     )
 
-    blocks = []
-    for stat in selected_stats:
-        w = agg_all.pivot(index="Rendszam", columns=["Year", "Month"], values=stat)
-        w.columns = [f"{int(yr)}_{int(m):02d}_{stat}" for yr, m in w.columns]
-        blocks.append(w)
+    parts = []
+    for s in stats:
+        w = agg_all.pivot(index="Rendszam", columns=["Year", "Month"], values=s)
+        w.columns = [f"{int(y)}_{int(m):02d}_{s}" for y, m in w.columns]
+        parts.append(w)
+    wide = pd.concat(parts, axis=1).reset_index()
 
-    wide_full = pd.concat(blocks, axis=1).reset_index()
+    if meta is not None:
+        wide = meta.merge(wide, on="Rendszam", how="right")
 
-    # prepend metadata (right join keeps stat columns order)
-    if table_choice == "melyviz_table":
-        wide_full = _load_coords().merge(wide_full, on="Rendszam", how="right")
+    # column order: Rendszam, meta cols, then stats blocks
+    ordered = ["Rendszam"]
+    if meta is not None:
+        ordered += [c for c in META_COLS[1:] if c in wide.columns]
+    for base in sorted({c.rsplit("_", 1)[0] for c in wide.columns
+                        if c not in ordered}):
+        for s in stats:
+            col = f"{base}_{s}"
+            if col in wide.columns:
+                ordered.append(col)
+    wide = wide[ordered]
+    st.dataframe(wide.head(), use_container_width=True)
 
-    # reorder: Rendszam + full META_COLS (except Rendszam itself) + stats blocks
-    ordered_cols = ["Rendszam"]
-    if table_choice == "melyviz_table":
-        ordered_cols += [col for col in META_COLS[1:] if col in wide_full.columns]
-
-    # then clock-sorted year-month blocks
-    for base in sorted({c.rsplit("_", 1)[0] for c in wide_full.columns if c not in ordered_cols}):
-        for stat in selected_stats:
-            col = f"{base}_{stat}"
-            if col in wide_full.columns:
-                ordered_cols.append(col)
-
-    wide_full = wide_full[ordered_cols]
-
-    st.dataframe(wide_full.head(), use_container_width=True)
-
-    # ── Excel download ────────────────────────────────────────────────────────
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        wide_full.to_excel(writer, index=False, sheet_name="MonthlyWide")
+    # ── 3.9 Excel download ───────────────────────────────────────────────────
+    buff = io.BytesIO()
+    with pd.ExcelWriter(buff, engine="xlsxwriter") as xls:
+        wide.to_excel(xls, index=False, sheet_name="MonthlyWide")
     st.download_button(
         "Download selected statistics (Excel)",
-        buffer.getvalue(),
-        file_name=f"monthly_{'_'.join(selected_stats)}_{table_choice}.xlsx",
+        buff.getvalue(),
+        file_name=f"monthly_{'_'.join(stats)}_{table_choice}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
