@@ -5,7 +5,32 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sqlalchemy.engine import Engine  # type hint only
 
-# URL of the metadata file with coordinates (public GitHub raw link)
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration – metadata columns we want from deep.csv
+# ──────────────────────────────────────────────────────────────────────────────
+META_COLS = [
+    "Rendszam",
+    "VMOEov_EOVx",
+    "VMOEov_EOVy",
+    "Torzsszam",
+    "vmoNev",
+    "VMOEov_Torzsszam",
+    "vFaAllomas_AdatgazdaNev",
+    "vFaAllomas_RetegvizkutTelepulesNev",
+    "vFaAllomas_KapcsSzkmNev",
+    "vFaAllomas_AllomasTVA",
+    "vFaAllomas_RetegvizkutJellegkodNev",
+    "vFaAllomas_RetegvizkutKatSzam",
+    "vFaAllomas_FaAllAdatforgTipNev",
+    "vFaAllomas_RetegvizkutTipuskodNev",
+    "vFaAllomas_RetegvizkutJelzoszam",
+    "vFaAllomas_RetegvizkutTerepmag",
+    "vFaAllomas_RetegvizkutKutperemmag",
+    "vFaAllomas_RetegvizkutKutmelyseg",
+    "vFaAllomas_FaAllVKImon",
+    "vFaAllomas_FaAllUzemelesNev",
+]
+
 COORDS_CSV_URL = (
     "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/deep.csv"
 )
@@ -14,31 +39,37 @@ COORDS_CSV_URL = (
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_table(engine: Engine, table_name: str) -> pd.DataFrame:
-    """Fetch an entire table via SQLAlchemy (so pandas is happy)."""
+    """Fetch a whole table via SQLAlchemy (so pandas is happy)."""
     query = f"SELECT * FROM `{table_name}`"
     with engine.connect() as conn:
         return pd.read_sql_query(query, conn)
 
 
 @st.cache_data(show_spinner=False)
-def _load_coords() -> pd.DataFrame:
-    """Load deep.csv (well metadata) once per session and keep only needed cols."""
-    cols_we_need = ["Rendszam", "VMOEov_EOVx", "VMOEov_EOVy"]
-    df = pd.read_csv(COORDS_CSV_URL, usecols=lambda c: c in cols_we_need)
-    df = df.drop_duplicates(subset="Rendszam")
-    return df
+def _load_metadata() -> pd.DataFrame:
+    """Read deep.csv once and guarantee all META_COLS are present."""
+    df = pd.read_csv(
+        COORDS_CSV_URL,
+        usecols=lambda c: c in META_COLS,   # pull only what we need
+        encoding="utf-8"
+    )
+    # Ensure every requested column exists
+    for col in META_COLS:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df.drop_duplicates("Rendszam")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main page
+# Main Streamlit page
 # ──────────────────────────────────────────────────────────────────────────────
 def monthly_page(engine: Engine) -> None:
     st.title("Monthly Groundwater Table Summary (Min / Mean / Max)")
 
-    # 1️⃣  Choose table & load data -------------------------------------------------
+    # 1️⃣  Choose table & load ------------------------------------------------------
     table_choice = st.selectbox(
         "Select groundwater table",
-        ["talajviz_table", "melyviz_table"]
+        ["talajviz_table", "melyviz_table"],
     )
 
     try:
@@ -47,10 +78,10 @@ def monthly_page(engine: Engine) -> None:
         st.error(f"Failed to load {table_choice}: {e}")
         return
 
-    # 1a️⃣  If melyviz_table → join coordinates ------------------------------------
+    # 1a️⃣  If melyviz_table → merge metadata -------------------------------------
     if table_choice == "melyviz_table":
-        coords = _load_coords()
-        df = df.merge(coords, on="Rendszam", how="left")
+        meta = _load_metadata()
+        df = df.merge(meta, on="Rendszam", how="left")
 
     # 2️⃣  Column mapping -----------------------------------------------------------
     col1 = (
@@ -68,7 +99,6 @@ def monthly_page(engine: Engine) -> None:
 
     # 3️⃣  Derived & time columns ---------------------------------------------------
     df["vizkutfenekmagasag"] = df[col1] + df[col2]
-
     if "Datum" not in df.columns:
         st.error("No 'Datum' column found.")
         return
@@ -81,7 +111,7 @@ def monthly_page(engine: Engine) -> None:
     selected_rendszam = st.multiselect(
         "Select wells for time-series plot",
         rendszam_unique,
-        default=rendszam_unique[:1] if rendszam_unique else []
+        default=rendszam_unique[:1] if rendszam_unique else [],
     )
 
     df_valid = df.dropna(subset=["Rendszam", "Year", "Month", "vizkutfenekmagasag"])
@@ -92,14 +122,12 @@ def monthly_page(engine: Engine) -> None:
 
     # 5️⃣  Stat check-boxes ---------------------------------------------------------
     st.subheader("Statistics to include")
-    show_mean = st.checkbox("Mean", value=True, key="chk_mean")
-    show_min  = st.checkbox("Min",  value=True, key="chk_min")
-    show_max  = st.checkbox("Max",  value=True, key="chk_max")
+    show_mean = st.checkbox("Mean", value=True)
+    show_min  = st.checkbox("Min",  value=True)
+    show_max  = st.checkbox("Max",  value=True)
 
     selected_stats = [
-        stat for stat, flag in
-        [("mean", show_mean), ("min", show_min), ("max", show_max)]
-        if flag
+        stat for stat, flag in [("mean", show_mean), ("min", show_min), ("max", show_max)] if flag
     ]
     if not selected_stats:
         st.warning("Please select at least one statistic.")
@@ -111,15 +139,12 @@ def monthly_page(engine: Engine) -> None:
         .agg(selected_stats)
         .reset_index()
     )
-    agg["date"] = pd.to_datetime(dict(year=agg["Year"],
-                                      month=agg["Month"], day=1))
+    agg["date"] = pd.to_datetime(dict(year=agg["Year"], month=agg["Month"], day=1))
 
-    # If melyviz_table → add coords to preview
     if table_choice == "melyviz_table":
-        agg = agg.merge(coords, on="Rendszam", how="left")
+        agg = agg.merge(meta[META_COLS], on="Rendszam", how="left")
 
-    st.dataframe(agg.sort_values(["Rendszam", "date"]),
-                 use_container_width=True)
+    st.dataframe(agg.sort_values(["Rendszam", "date"]), use_container_width=True)
 
     # 7️⃣  Plot ---------------------------------------------------------------------
     st.subheader("Time-series plot")
@@ -130,14 +155,11 @@ def monthly_page(engine: Engine) -> None:
         g = agg[agg["Rendszam"] == rendszam]
         color = cmap(idx % 10)
         if "mean" in selected_stats:
-            plt.plot(g["date"], g["mean"], label=f"{rendszam} Mean",
-                     color=color, linestyle="-")
+            plt.plot(g["date"], g["mean"], label=f"{rendszam} Mean", color=color, linestyle="-")
         if "max" in selected_stats:
-            plt.plot(g["date"], g["max"],  label=f"{rendszam} Max",
-                     color=color, linestyle="--")
+            plt.plot(g["date"], g["max"],  label=f"{rendszam} Max",  color=color, linestyle="--")
         if "min" in selected_stats:
-            plt.plot(g["date"], g["min"],  label=f"{rendszam} Min",
-                     color=color, linestyle=":")
+            plt.plot(g["date"], g["min"],  label=f"{rendszam} Min",  color=color, linestyle=":")
     plt.xlabel("Date")
     plt.ylabel("vizkutfenekmagasag")
     plt.title("Monthly statistics by well")
@@ -153,28 +175,21 @@ def monthly_page(engine: Engine) -> None:
         .reset_index()
     )
 
-    # prepare wide blocks
     wide_parts = []
     for stat in selected_stats:
-        wide = agg_all.pivot(index="Rendszam",
-                             columns=["Year", "Month"],
-                             values=stat)
-        wide.columns = [f"{int(yr)}_{int(mn):02d}_{stat}"
-                        for yr, mn in wide.columns]
+        wide = agg_all.pivot(index="Rendszam", columns=["Year", "Month"], values=stat)
+        wide.columns = [f"{int(yr)}_{int(mn):02d}_{stat}" for yr, mn in wide.columns]
         wide_parts.append(wide)
 
     wide_full = pd.concat(wide_parts, axis=1).reset_index()
 
-    # If melyviz_table → prepend coordinates
     if table_choice == "melyviz_table":
-        wide_full = coords.merge(wide_full, on="Rendszam", how="right")
+        wide_full = meta[META_COLS].merge(wide_full, on="Rendszam", how="right")
 
-    # reorder columns: Rendszam, coords (if any), then stats blocks
-    ordered_cols = ["Rendszam"]
-    if table_choice == "melyviz_table":
-        ordered_cols += ["VMOEov_EOVx", "VMOEov_EOVy"]
+    # --- order columns: metadata first, then stats blocks ------------------------
+    ordered_cols = [c for c in META_COLS if c in wide_full.columns]
 
-    # collect blocks
+    # stats blocks (same logic as before)
     for base in sorted({c.rsplit("_", 1)[0] for c in wide_full.columns
                         if c not in ordered_cols}):
         for stat in selected_stats:
@@ -194,5 +209,5 @@ def monthly_page(engine: Engine) -> None:
         "Download selected statistics (Excel)",
         buffer.getvalue(),
         file_name=f"monthly_{'_'.join(selected_stats)}_{table_choice}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
