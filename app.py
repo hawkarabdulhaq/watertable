@@ -1,45 +1,58 @@
+# app.py
+import os
 import streamlit as st
-import mysql.connector
+from sqlalchemy import create_engine, text
 
 from database import database_viewer_page
-from monthly import monthly_page
+from monthly   import monthly_page
 
 st.set_page_config(page_title="Well Database Viewer", layout="wide")
 
-# --- MySQL connection settings ---
+# ------------------------------------------------------------------------------
+# 🐬  MySQL connection settings  – use SQLAlchemy (no pandas warning)
+# ------------------------------------------------------------------------------
+
 MYSQL_CONFIG = {
-    "host": "188.36.44.146",
-    "port": 8081,
-    "user": "Hawkar",
-    "password": "Noway2025",
-    "database": "wells"
+    "host":     "188.36.44.146",
+    "port":     8081,                     # unusual, but keep as-is
+    "user":     "Hawkar",
+    "password": "Noway2025",              # ❗ Consider ENV VAR in production
+    "database": "wells",
 }
 
-def get_mysql_conn():
-    return mysql.connector.connect(**MYSQL_CONFIG)
+# Build an SQLAlchemy URL → mysql+mysqlconnector://user:pw@host:port/db
+MYSQL_URI = (
+    f"mysql+mysqlconnector://{MYSQL_CONFIG['user']}:{MYSQL_CONFIG['password']}"
+    f"@{MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}/{MYSQL_CONFIG['database']}"
+)
 
+# Re-use one engine for the whole session (Streamlit cache)
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    return create_engine(MYSQL_URI, pool_recycle=3600, pool_pre_ping=True)
+
+engine = get_engine()
+
+# ------------------------------------------------------------------------------
 # Sidebar navigation
+# ------------------------------------------------------------------------------
 st.sidebar.title("Navigation")
-if 'page' not in st.session_state:
-    st.session_state.page = "Database Viewer"
+page = st.sidebar.radio(
+    "Choose a page:",
+    ["Database Viewer", "Monthly"],
+    index=0 if "page" not in st.session_state else ["Database Viewer", "Monthly"].index(st.session_state["page"]),
+    key="page"
+)
 
-if st.sidebar.button("Database Viewer"):
-    st.session_state.page = "Database Viewer"
-if st.sidebar.button("Monthly"):
-    st.session_state.page = "Monthly"
-
-page = st.session_state.page
-
-# Open the connection once, share with both pages
+# ------------------------------------------------------------------------------
+# Dispatch pages
+# ------------------------------------------------------------------------------
 try:
-    conn = get_mysql_conn()
-except Exception as e:
-    st.error(f"Could not connect to database: {e}")
-    st.stop()
-
-if page == "Database Viewer":
-    database_viewer_page(conn)
-elif page == "Monthly":
-    monthly_page(conn)
-
-conn.close()
+    if page == "Database Viewer":
+        database_viewer_page(engine)      # pass engine instead of raw connector
+    elif page == "Monthly":
+        monthly_page(engine)
+finally:
+    # Optional: dispose when Streamlit session dies
+    # (engine gets cached; disposal here is usually harmless)
+    engine.dispose(close=False)
