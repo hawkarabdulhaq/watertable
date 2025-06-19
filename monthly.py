@@ -3,17 +3,19 @@ import io
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-from sqlalchemy.engine import Engine  # type-hint only
+from sqlalchemy.engine import Engine  # type hints only
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1.  CSV with well metadata
+# 1.  URLs + column lists for both metadata files
 # ──────────────────────────────────────────────────────────────────────────────
-META_CSV_URL = (
+DEEP_CSV_URL = (
     "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/deep.csv"
 )
+SHALLOW_CSV_URL = (
+    "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/shallow.csv"
+)
 
-# Columns to bring in from deep.csv – first is Rendszam (key)
-META_COLS = [
+DEEP_COLS = [  # already used earlier
     "Rendszam",
     "VMOEov_EOVx",
     "VMOEov_EOVy",
@@ -35,28 +37,56 @@ META_COLS = [
     "vFaAllomas_FaAllUzemelesNev",
 ]
 
+SHALLOW_COLS = [
+    "vmoTipusKod",
+    "Torzsszam",
+    "vmoNev",
+    "Rendszam",
+    "VMOEov_EOVx",
+    "VMOEov_EOVy",
+    "vFkAllomas_AdatgazdaNev",
+    "vFkAllomas_Nevr",
+    "vFkAllomas_Leiras",
+    "vFkAllomas_TalajvizkutTelepulesNev",
+    "vFkAllomas_KapcsSzkmNev",
+    "vFkAllomas_AllomasTavmBemenetNev",
+    "vFkAllomas_AllomasTVA",
+    "vFkAllomas_TalajvizkutKatSzam",
+    "vFkAllomas_TalajvizkutJelzoszam",
+    "vFkAllomas_FkAllAdatforgTipNev",
+    "vFkAllomas_TalajvizkutVizminVanE",
+    "vFkAllomas_TalajvizkutTipuskodNev",
+    "vFkAllomas_TalajvizkutTerepmag",
+    "vFkAllomas_TalajvizkutKutperemmag",
+    "vFkAllomas_TalajvizkutKutmelyseg",
+    "vFkAllomas_TalajvizjutGyorsadat",
+    "vFkAllomas_FkAllVKImon",
+    "vFkAllomas_FkAllUzemelesNev",
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  Cached loaders for metadata
+# ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def _load_meta() -> pd.DataFrame:
-    """Read deep.csv once per session, keep only META_COLS, return deduplicated."""
-    df = pd.read_csv(META_CSV_URL, usecols=lambda c: c in META_COLS)
+def _load_meta(url: str, cols: list[str]) -> pd.DataFrame:
+    df = pd.read_csv(url, usecols=lambda c: c in cols)
     return df.drop_duplicates(subset="Rendszam")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2.  SQL helper
+# 3.  SQL helper
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_table(engine: Engine, table: str) -> pd.DataFrame:
-    """SELECT * FROM table via SQLAlchemy (no pandas warning)."""
     sql = f"SELECT * FROM `{table}`"
     with engine.connect() as conn:
         return pd.read_sql_query(sql, conn)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3.  Main Streamlit page
+# 4.  Main Streamlit page
 # ──────────────────────────────────────────────────────────────────────────────
 def monthly_page(engine: Engine) -> None:
     st.title("Monthly Groundwater Table Summary (Min / Mean / Max)")
 
-    # ── 3.1 choose table & load ───────────────────────────────────────────────
+    # 4.1  Choose table & load -------------------------------------------------
     table_choice = st.selectbox(
         "Select groundwater table", ["talajviz_table", "melyviz_table"]
     )
@@ -66,19 +96,20 @@ def monthly_page(engine: Engine) -> None:
         st.error(f"Failed to load {table_choice}: {e}")
         return
 
-    # ── 3.2 merge metadata if melyviz_table ──────────────────────────────────
+    # 4.2  Attach appropriate metadata ----------------------------------------
     if table_choice == "melyviz_table":
-        meta = _load_meta()
+        meta_cols, meta_df = DEEP_COLS, _load_meta(DEEP_CSV_URL, DEEP_COLS)
+    else:  # talajviz_table
+        meta_cols, meta_df = SHALLOW_COLS, _load_meta(SHALLOW_CSV_URL, SHALLOW_COLS)
 
-        # avoid duplicate cols that already exist in the SQL table
-        dupes = [c for c in META_COLS if c != "Rendszam" and c in df.columns]
-        meta = meta.drop(columns=dupes)
+    # drop metadata columns that are already in the SQL table
+    dupes = [c for c in meta_cols if c != "Rendszam" and c in df.columns]
+    if dupes:
+        meta_df = meta_df.drop(columns=dupes)
 
-        df = df.merge(meta, on="Rendszam", how="left")
-    else:
-        meta = None  # talajviz_table
+    df = df.merge(meta_df, on="Rendszam", how="left")
 
-    # ── 3.3 required columns / derived field ─────────────────────────────────
+    # 4.3  Required columns & derived value ------------------------------------
     col1 = (
         "vFkAllomas_TalajvizkutKutperemmag"
         if table_choice == "talajviz_table"
@@ -101,44 +132,38 @@ def monthly_page(engine: Engine) -> None:
     df["Year"]  = df["Datum"].dt.year
     df["Month"] = df["Datum"].dt.month
 
-    # ── 3.4 well selector ────────────────────────────────────────────────────
+    # 4.4  Well selector -------------------------------------------------------
     wells = sorted(df["Rendszam"].dropna().unique())
     selected = st.multiselect(
-        "Select wells for time-series plot",
-        wells,
-        default=wells[:1] if wells else [],
+        "Select wells for time-series plot", wells, default=wells[:1] if wells else []
     )
-
     df_valid = df.dropna(subset=["Rendszam", "Year", "Month", "vizkutfenekmagasag"])
-    df_plot = (
-        df_valid[df_valid["Rendszam"].isin(selected)] if selected else df_valid
-    )
+    df_plot = df_valid[df_valid["Rendszam"].isin(selected)] if selected else df_valid
 
-    # ── 3.5 stats check-boxes ────────────────────────────────────────────────
+    # 4.5  Stats check-boxes ----------------------------------------------------
     st.subheader("Statistics to include")
     opts = {
-        "mean": st.checkbox("Mean", value=True, key="chk_mean"),
-        "min":  st.checkbox("Min",  value=True, key="chk_min"),
-        "max":  st.checkbox("Max",  value=True, key="chk_max"),
+        "mean": st.checkbox("Mean", value=True),
+        "min":  st.checkbox("Min",  value=True),
+        "max":  st.checkbox("Max",  value=True),
     }
     stats = [k for k, v in opts.items() if v]
     if not stats:
         st.warning("Please select at least one statistic.")
         return
 
-    # ── 3.6 aggregate for preview / plot ─────────────────────────────────────
+    # 4.6  Aggregate for preview & plot ----------------------------------------
     agg = (
         df_plot.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
         .agg(stats)
         .reset_index()
     )
     agg["date"] = pd.to_datetime(dict(year=agg["Year"], month=agg["Month"], day=1))
-    if meta is not None:
-        agg = agg.merge(meta, on="Rendszam", how="left")
+    agg = agg.merge(meta_df, on="Rendszam", how="left")
 
     st.dataframe(agg.sort_values(["Rendszam", "date"]), use_container_width=True)
 
-    # ── 3.7 plot ─────────────────────────────────────────────────────────────
+    # 4.7  Plot ----------------------------------------------------------------
     st.subheader("Time-series plot")
     plt.figure(figsize=(12, 4))
     cmap = plt.get_cmap("tab10")
@@ -155,37 +180,32 @@ def monthly_page(engine: Engine) -> None:
     plt.legend(); plt.tight_layout()
     st.pyplot(plt.gcf()); plt.clf()
 
-    # ── 3.8 build “wide” download table ──────────────────────────────────────
+    # 4.8  Wide download table -------------------------------------------------
     agg_all = (
         df_valid.groupby(["Rendszam", "Year", "Month"])["vizkutfenekmagasag"]
         .agg(stats)
         .reset_index()
     )
-
-    parts = []
+    blocks = []
     for s in stats:
         w = agg_all.pivot(index="Rendszam", columns=["Year", "Month"], values=s)
         w.columns = [f"{int(y)}_{int(m):02d}_{s}" for y, m in w.columns]
-        parts.append(w)
-    wide = pd.concat(parts, axis=1).reset_index()
+        blocks.append(w)
+    wide = pd.concat(blocks, axis=1).reset_index()
+    wide = meta_df.merge(wide, on="Rendszam", how="right")
 
-    if meta is not None:
-        wide = meta.merge(wide, on="Rendszam", how="right")
-
-    # column order: Rendszam, meta cols, then stats blocks
-    ordered = ["Rendszam"]
-    if meta is not None:
-        ordered += [c for c in META_COLS[1:] if c in wide.columns]
-    for base in sorted({c.rsplit("_", 1)[0] for c in wide.columns
-                        if c not in ordered}):
+    # Column order: Rendszam, metadata (in list order), then stat blocks
+    ordered = ["Rendszam"] + [c for c in meta_cols if c != "Rendszam" and c in wide.columns]
+    for base in sorted({c.rsplit("_", 1)[0] for c in wide.columns if c not in ordered}):
         for s in stats:
             col = f"{base}_{s}"
             if col in wide.columns:
                 ordered.append(col)
     wide = wide[ordered]
+
     st.dataframe(wide.head(), use_container_width=True)
 
-    # ── 3.9 Excel download ───────────────────────────────────────────────────
+    # 4.9  Excel download -------------------------------------------------------
     buff = io.BytesIO()
     with pd.ExcelWriter(buff, engine="xlsxwriter") as xls:
         wide.to_excel(xls, index=False, sheet_name="MonthlyWide")
