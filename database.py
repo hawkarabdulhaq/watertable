@@ -1,7 +1,13 @@
+# database.py
 import streamlit as st
 import pandas as pd
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Engine   # type-hint only
 
-def clean_numeric_columns(df):
+# ──────────────────────────────────────────────────────────────────────────────
+# Utility: clean numeric columns
+# ──────────────────────────────────────────────────────────────────────────────
+def clean_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     num_cols = [
         'nyug_vizszint', 'uz_vizszint', 'vizhozam', 'havi_kiterm_viz', 'havi_uzemora', 'Vizmerleg',
         'EOVX', 'EOVY', 'VMOEov_EOVx', 'VMOEov_EOVy', 'TSZF', 'TALP',
@@ -19,41 +25,57 @@ def clean_numeric_columns(df):
             df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
 
-def get_mysql_table_names(conn):
-    q = "SHOW TABLES"
-    cur = conn.cursor()
-    cur.execute(q)
-    tables = [row[0] for row in cur.fetchall()]
-    cur.close()
-    return tables
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  Table-name helper (uses SQLAlchemy Inspector)
+# ──────────────────────────────────────────────────────────────────────────────
+def get_mysql_table_names(engine: Engine):
+    return inspect(engine).get_table_names()
 
-def fast_mysql_insert(df, table_name, conn, chunksize=1000):
-    cursor = conn.cursor()
-    cols = ", ".join([f"`{col}`" for col in df.columns])
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  Fast insert using raw DB-API connection from the engine
+# ──────────────────────────────────────────────────────────────────────────────
+def fast_mysql_insert(df: pd.DataFrame, table: str, engine: Engine, chunksize: int = 1000):
+    """
+    Bulk-insert a DataFrame into `table` in chunks via the engine's raw connection.
+    Keeps your old executemany logic but works with SQLAlchemy.
+    """
+    raw = engine.raw_connection()          # DB-API connection (mysql-connector)
+    cursor = raw.cursor()
+
+    cols = ", ".join([f"`{c}`" for c in df.columns])
     placeholders = ", ".join(["%s"] * len(df.columns))
-    sql = f"INSERT INTO {table_name} ({cols}) VALUES ({placeholders})"
+    sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+
     rows = df.values.tolist()
     n = len(rows)
-    progress = st.progress(0, text="Uploading...")
+    progress = st.progress(0, text="Uploading…")
+
     for i in range(0, n, chunksize):
-        batch = rows[i:i+chunksize]
+        batch = rows[i:i + chunksize]
         cursor.executemany(sql, batch)
-        conn.commit()
-        progress.progress(min(i+chunksize, n)/n, text=f"Uploaded {min(i+chunksize, n)} / {n} rows")
+        raw.commit()
+        progress.progress(min(i + chunksize, n) / n,
+                          text=f"Uploaded {min(i + chunksize, n)} / {n} rows")
+
     progress.empty()
     cursor.close()
-    st.success(f"Successfully uploaded {n} rows to {table_name}.")
+    raw.close()
+    st.success(f"Successfully uploaded {n} rows to `{table}`.")
 
-def database_viewer_page(conn):
+# ──────────────────────────────────────────────────────────────────────────────
+# 3.  Main Streamlit page
+# ──────────────────────────────────────────────────────────────────────────────
+def database_viewer_page(engine: Engine):
     st.title("Well Database Page")
     tabs = st.tabs(["Database Viewer", "Upload CSV to Table"])
 
-    # -------- TAB 1: VIEWER/DELETE --------
+    # ── TAB 1: VIEWER / DELETE ───────────────────────────────────────────────
     with tabs[0]:
-        table_names = get_mysql_table_names(conn)
+        table_names = get_mysql_table_names(engine)
         table_to_show = st.selectbox("Select table to display:", table_names)
+
         try:
-            df = pd.read_sql(f"SELECT * FROM {table_to_show}", conn)
+            df = pd.read_sql_query(f"SELECT * FROM `{table_to_show}`", engine)
         except Exception as e:
             st.error(f"Failed to load {table_to_show}: {e}")
             return
@@ -62,95 +84,90 @@ def database_viewer_page(conn):
         st.markdown(f"Showing **{len(df)}** rows from **{table_to_show}**.")
         st.dataframe(df, use_container_width=True)
 
-        # Filters (same as before)
+        # -------------- Quick filters ----------------------------------------
         if table_to_show == "wells":
             st.subheader("Quick Filter for Wells Table")
-            county = st.selectbox("County (VARMEGYE)", ["All"] + sorted(df['VARMEGYE'].dropna().unique()))
+            county = st.selectbox("County (VARMEGYE)",
+                                  ["All"] + sorted(df['VARMEGYE'].dropna().unique()))
             if county != "All":
-                filtered = df[df['VARMEGYE'] == county]
-                filtered = clean_numeric_columns(filtered)
+                filtered = clean_numeric_columns(df[df['VARMEGYE'] == county])
                 st.dataframe(filtered, use_container_width=True)
                 st.markdown(f"Found **{len(filtered)}** wells in **{county}**.")
+
         elif table_to_show == "osap_timeseries":
             st.subheader("Quick Filter for OSAP Timeseries Table")
             colA, colB = st.columns(2)
             with colA:
-                unique_vor = ["All"] + sorted(df['VOR'].dropna().unique())
-                selected_vor = st.selectbox("VOR (Well code)", unique_vor)
+                vor = st.selectbox("VOR (Well code)",
+                                   ["All"] + sorted(df['VOR'].dropna().unique()))
             with colB:
-                unique_years = ["All"] + sorted(df['year'].dropna().unique())
-                selected_year = st.selectbox("Year", unique_years)
+                year = st.selectbox("Year",
+                                    ["All"] + sorted(df['year'].dropna().unique()))
             filtered = df.copy()
-            if selected_vor != "All":
-                filtered = filtered[filtered['VOR'] == selected_vor]
-            if selected_year != "All":
-                filtered = filtered[filtered['year'] == selected_year]
-            if selected_vor != "All" or selected_year != "All":
-                filtered = clean_numeric_columns(filtered)
-                st.dataframe(filtered, use_container_width=True)
+            if vor != "All":
+                filtered = filtered[filtered['VOR'] == vor]
+            if year != "All":
+                filtered = filtered[filtered['year'] == year]
+            if vor != "All" or year != "All":
+                st.dataframe(clean_numeric_columns(filtered), use_container_width=True)
                 st.markdown(f"Found **{len(filtered)}** records for your filter.")
+
         elif table_to_show == "vizmerleg_table":
             st.subheader("Quick Filter for Vizmerleg Table")
-            vor = st.selectbox("VOR (Well code)", ["All"] + sorted(df['VOR'].dropna().unique()))
+            vor = st.selectbox("VOR (Well code)",
+                               ["All"] + sorted(df['VOR'].dropna().unique()))
             if vor != "All":
                 filtered = df[df['VOR'] == vor]
                 st.dataframe(filtered, use_container_width=True)
                 st.markdown(f"Found **{len(filtered)}** records for VOR = **{vor}**.")
-        elif table_to_show == "talajviz_table":
-            st.subheader("Quick Filter for Talajviz Table")
-            rendszam = st.selectbox("Rendszam", ["All"] + sorted(df['Rendszam'].dropna().unique()))
-            if rendszam != "All":
-                filtered = df[df['Rendszam'] == rendszam]
-                st.dataframe(filtered, use_container_width=True)
-                st.markdown(f"Found **{len(filtered)}** records for Rendszam = **{rendszam}**.")
-        elif table_to_show == "melyviz_table":
-            st.subheader("Quick Filter for Melyviz Table (Deep Wells)")
-            rendszam = st.selectbox("Rendszam", ["All"] + sorted(df['Rendszam'].dropna().unique()))
+
+        elif table_to_show in ("talajviz_table", "melyviz_table"):
+            st.subheader(f"Quick Filter for {table_to_show} Table")
+            rendszam = st.selectbox("Rendszam",
+                                    ["All"] + sorted(df['Rendszam'].dropna().unique()))
             if rendszam != "All":
                 filtered = df[df['Rendszam'] == rendszam]
                 st.dataframe(filtered, use_container_width=True)
                 st.markdown(f"Found **{len(filtered)}** records for Rendszam = **{rendszam}**.")
 
+        # -------------- Danger zone: delete entire table ----------------------
         st.markdown("---")
         st.subheader("⚠️ Danger zone: Delete all data from this table")
-        if st.button(f"Delete ALL data from '{table_to_show}' table"):
+        if st.button(f"Delete ALL data from `{table_to_show}` table"):
             try:
-                cur = conn.cursor()
-                cur.execute(f"DELETE FROM {table_to_show};")
-                conn.commit()
-                cur.close()
-                st.success(f"All data deleted from '{table_to_show}'. Please refresh to see effect.")
+                with engine.begin() as conn:      # auto-commit on success
+                    conn.execute(text(f"DELETE FROM `{table_to_show}`"))
+                st.success(f"All data deleted from `{table_to_show}`. Refresh to see effect.")
             except Exception as e:
                 st.error(f"Could not delete data: {e}")
 
-    # -------- TAB 2: UPLOAD CSV --------
+    # ── TAB 2: UPLOAD CSV ────────────────────────────────────────────────────
     with tabs[1]:
         st.header("Upload CSV to Any Table")
-        st.markdown("You can upload a CSV to any table. The columns must match the table columns exactly (see note below for accented columns).")
-        table_names = get_mysql_table_names(conn)
-        table_to_upload = st.selectbox("Select table to upload to:", table_names, key="upload_select_table")
+        st.markdown("Columns must match the table exactly; see note below for accented columns.")
+        table_names = get_mysql_table_names(engine)
+        table_to_upload = st.selectbox("Select table to upload to:", table_names,
+                                       key="upload_select_table")
 
-        uploaded_file = st.file_uploader("Choose CSV file to upload (columns must match table)", type=["csv"], key="upload_file")
-        if uploaded_file is not None:
+        uploaded = st.file_uploader("Choose CSV file", type=["csv"], key="upload_file")
+        if uploaded:
             try:
-                df_new = pd.read_csv(uploaded_file)
+                df_new = pd.read_csv(uploaded)
 
-                # Handle accented columns for talajviz_table and melyviz_table
-                if table_to_upload == "talajviz_table":
-                    col_rename = {'Dátum': 'Datum', 'Talajvízállás': 'Talajvizallas'}
-                    df_new = df_new.rename(columns=col_rename)
-                if table_to_upload == "melyviz_table":
-                    col_rename = {'Dátum': 'Datum', 'Talajvízállás': 'Talajvizallas'}
-                    df_new = df_new.rename(columns=col_rename)
+                # Rename accented columns for talajviz/melyviz tables
+                if table_to_upload in ("talajviz_table", "melyviz_table"):
+                    df_new = df_new.rename(columns={'Dátum': 'Datum',
+                                                    'Talajvízállás': 'Talajvizallas'})
 
-                st.write("First 5 rows of your file (after column name fix if any):")
+                st.write("First 5 rows of the file (after any renaming):")
                 st.dataframe(df_new.head())
 
-                if st.button(f"Upload to '{table_to_upload}' table"):
-                    fast_mysql_insert(df_new, table_to_upload, conn, chunksize=1000)
+                if st.button(f"Upload to `{table_to_upload}` table"):
+                    fast_mysql_insert(df_new, table_to_upload, engine, chunksize=1000)
             except Exception as e:
                 st.error(f"Failed to import CSV: {e}")
+
         st.markdown("""
-        **Note:** If uploading to `talajviz_table` or `melyviz_table`, columns `Dátum` and `Talajvízállás`
-        will be automatically renamed to `Datum` and `Talajvizallas`.
+        **Note:** When uploading to `talajviz_table` or `melyviz_table`, columns `Dátum`
+        and `Talajvízállás` are automatically renamed to `Datum` and `Talajvizallas`.
         """)
