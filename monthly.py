@@ -3,11 +3,11 @@ import io
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-from sqlalchemy.engine import Engine         # type-hint only
+from sqlalchemy.engine import Engine  # type-hint only
 
-# ──────────────────────────────────────────────────────────────
-# 1.  Metadata sources & columns
-# ──────────────────────────────────────────────────────────────
+# ───────────────────────────────
+# 1.  CSV sources & wanted fields
+# ───────────────────────────────
 SHALLOW_CSV_URL = (
     "https://raw.githubusercontent.com/hawkarabdulhaq/watertable/main/input/shallow.csv"
 )
@@ -52,59 +52,61 @@ def load_deep_meta() -> pd.DataFrame:
         .drop_duplicates(subset="Rendszam")
     )
 
+# ───────────────────────────────
+# 2.  SQL helper
+# ───────────────────────────────
 def load_table(engine: Engine, name: str) -> pd.DataFrame:
     sql = f"SELECT * FROM `{name}`"
     with engine.connect() as conn:
         return pd.read_sql_query(sql, conn)
 
-# ──────────────────────────────────────────────────────────────
-# 2.  Main Streamlit page
-# ──────────────────────────────────────────────────────────────
+# ───────────────────────────────
+# 3.  Main Streamlit page
+# ───────────────────────────────
 def monthly_page(engine: Engine) -> None:
     st.title("Monthly Groundwater Table Summary (Min / Mean / Max)")
     debug = st.sidebar.checkbox("🔧 Debug mode")
 
-    # --------------------------------- choose & load data
+    # 3-A  choose table & load SQL data
     table_choice = st.selectbox(
         "Select groundwater table", ["talajviz_table", "melyviz_table"]
     )
     try:
-        df = load_table(engine, table_choice)
+        df_sql = load_table(engine, table_choice)
     except Exception as e:
         st.error(f"Failed to load {table_choice}: {e}")
         return
     if debug:
-        st.sidebar.write(f"SQL table shape: {df.shape}")
+        st.sidebar.write(f"SQL table shape: {df_sql.shape}")
 
-    # --------------------------------- choose metadata + merge
+    # 3-B  pick metadata and merge (CSV values override SQL)
     if table_choice == "talajviz_table":
         meta_cols, meta = SHALLOW_COLS, load_shallow_meta()
     else:
         meta_cols, meta = DEEP_COLS, load_deep_meta()
 
-    # drop SQL-duplicate columns from meta (except Rendszam)
-    dupes = [c for c in meta_cols if c != "Rendszam" and c in df.columns]
-    if dupes:
-        meta = meta.drop(columns=dupes)
-        if debug:
-            st.sidebar.write(f"Dropped duplicate cols from meta: {dupes}")
-
     if debug:
         st.sidebar.write(f"Metadata shape: {meta.shape}")
-        with st.expander("Metadata head"):
-            st.dataframe(meta.head())
 
-    df = df.merge(meta, on="Rendszam", how="left")
+    # Merge with suffixes so *CSV* keeps original names, SQL duplicates get *_sql
+    df = df_sql.merge(meta, on="Rendszam", how="left", suffixes=("_sql", ""))
+
+    # After merge, drop the *_sql columns (i.e. keep CSV values)
+    drop_cols = [c for c in df.columns if c.endswith("_sql")]
+    df.drop(columns=drop_cols, inplace=True)
+    if debug and drop_cols:
+        st.sidebar.write(f"Dropped SQL duplicates: {drop_cols}")
+
+    # Debug counts for coordinates
     if debug:
-        found = df["VMOEov_EOVx"].notna().sum()
-        total = len(df)
+        non_null = df["VMOEov_EOVx"].notna().sum()
         st.sidebar.write(
-            f"Coordinate merge — non-null VMOEov_EOVx/EOVy rows: {found}/{total}"
+            f"Coordinates present after merge: {non_null}/{len(df)}"
         )
-        with st.expander("Post-merge coordinates preview"):
+        with st.expander("Coordinates preview"):
             st.dataframe(df[["Rendszam","VMOEov_EOVx","VMOEov_EOVy"]].head())
 
-    # --------------------------------- column mapping
+    # 3-C  required columns & derived field
     col1 = (
         "vFkAllomas_TalajvizkutKutperemmag"
         if table_choice == "talajviz_table"
@@ -119,7 +121,6 @@ def monthly_page(engine: Engine) -> None:
         st.error("Required columns are missing in the selected table.")
         return
 
-    # --------------------------------- derived & date parts
     df["vizkutfenekmagasag"] = df[col1] + df[col2]
     if "Datum" not in df.columns:
         st.error("No 'Datum' column found.")
@@ -128,7 +129,7 @@ def monthly_page(engine: Engine) -> None:
     df["Year"]  = df["Datum"].dt.year
     df["Month"] = df["Datum"].dt.month
 
-    # --------------------------------- well selector
+    # 3-D  well selector
     wells = sorted(df["Rendszam"].dropna().unique())
     selected = st.multiselect(
         "Select wells for time-series plot",
@@ -136,30 +137,31 @@ def monthly_page(engine: Engine) -> None:
         default=wells[:1] if wells else [],
     )
 
-    df_valid = df.dropna(subset=["Rendszam", "Year", "Month", "vizkutfenekmagasag"])
-    df_plot = df_valid[df_valid["Rendszam"].isin(selected)] if selected else df_valid
+    df_valid = df.dropna(subset=["Rendszam","Year","Month","vizkutfenekmagasag"])
+    df_plot  = df_valid[df_valid["Rendszam"].isin(selected)] if selected else df_valid
 
-    # --------------------------------- stat checkboxes
+    # 3-E  stats check-boxes
     st.subheader("Statistics to include")
-    stats = [s for s, flag in [
+    stats = [s for s, ok in [
         ("mean", st.checkbox("Mean", True)),
         ("min",  st.checkbox("Min",  True)),
         ("max",  st.checkbox("Max",  True)),
-    ] if flag]
+    ] if ok]
     if not stats:
         st.warning("Please select at least one statistic.")
         return
 
-    # --------------------------------- aggregate for preview & plot
+    # 3-F  aggregate for preview & plot
     agg = (
         df_plot.groupby(["Rendszam","Year","Month"])["vizkutfenekmagasag"]
         .agg(stats).reset_index()
     )
     agg["date"] = pd.to_datetime(dict(year=agg["Year"], month=agg["Month"], day=1))
     agg = agg.merge(meta, on="Rendszam", how="left")
+
     st.dataframe(agg.sort_values(["Rendszam","date"]), use_container_width=True)
 
-    # --------------------------------- plot
+    # 3-G  time-series plot
     st.subheader("Time-series plot")
     plt.figure(figsize=(12,4))
     cmap = plt.get_cmap("tab10")
@@ -172,7 +174,7 @@ def monthly_page(engine: Engine) -> None:
     plt.legend(); plt.tight_layout()
     st.pyplot(plt.gcf()); plt.clf()
 
-    # --------------------------------- wide table for download
+    # 3-H  build wide table
     agg_all = (
         df_valid.groupby(["Rendszam","Year","Month"])["vizkutfenekmagasag"]
         .agg(stats).reset_index()
@@ -183,21 +185,22 @@ def monthly_page(engine: Engine) -> None:
         w.columns=[f"{int(y)}_{int(m):02d}_{s}" for y,m in w.columns]
         parts.append(w)
     wide = pd.concat(parts, axis=1).reset_index()
-    wide = meta.merge(wide,on="Rendszam",how="right")
+    wide = meta.merge(wide, on="Rendszam", how="right")
 
-    # order columns
-    ordered=["Rendszam"]+[c for c in meta.columns if c!="Rendszam"]
+    # order columns: Rendszam, all meta fields in their original order, then stats
+    ordered = ["Rendszam"] + [c for c in meta_cols if c != "Rendszam"]
     for base in sorted({c.rsplit("_",1)[0] for c in wide.columns if c not in ordered}):
         for s in stats:
-            col=f"{base}_{s}"
-            if col in wide.columns: ordered.append(col)
-    wide=wide[ordered]
+            col = f"{base}_{s}"
+            if col in wide.columns:
+                ordered.append(col)
+    wide = wide[ordered]
     st.dataframe(wide.head(), use_container_width=True)
 
-    # --------------------------------- download
-    buff=io.BytesIO()
+    # 3-I  download Excel
+    buff = io.BytesIO()
     with pd.ExcelWriter(buff, engine="xlsxwriter") as xls:
-        wide.to_excel(xls,index=False,sheet_name="MonthlyWide")
+        wide.to_excel(xls, index=False, sheet_name="MonthlyWide")
     st.download_button(
         "Download selected statistics (Excel)",
         buff.getvalue(),
